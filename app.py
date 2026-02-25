@@ -6,9 +6,10 @@ Sentinel-2 based NDTI (Normalized Difference Turbidity Index) calculation
 ALGORITHM:
 1. Link S2_SR with S2_CLOUD_PROBABILITY
 2. Cloud masking: probability < 15
-3. Water body detection: NDWI = (B3 - B12) / (B3 + B12) > 0.1
-4. Turbidity: NDTI = (B4 - B3) / (B4 + B3)
-5. Monthly composites with mean turbidity statistics
+3. Snow detection (preprocessing): NDSI = (B3 - B11) / (B3 + B11) > 0.3 excluded from water
+4. Water body detection: NDWI = (B3 - B12) / (B3 + B12) > 0.1
+5. Turbidity: NDTI = (B4 - B3) / (B4 + B3)
+6. Monthly composites with mean turbidity statistics
 """
 
 import os
@@ -63,9 +64,9 @@ CLOUD_PROB_THRESHOLD = 15
 NDWI_THRESHOLD_TURBIDITY = 0.1  # NDWI using B3, B12
 NDWI_THRESHOLD_CHLOROPHYLL = 0.05  # NDWI using B3, B8
 
-# Snow detection thresholds
+# Snow detection thresholds (used as preprocessing to exclude snow from water)
 # NDSI (Normalized Difference Snow Index) = (B3 - B11) / (B3 + B11)
-NDSI_THRESHOLD = 0.4
+NDSI_THRESHOLD = 0.3
 SNOW_B11_THRESHOLD = 0.1  # Snow has high SWIR reflectance, water has low
 
 # Water Quality Parameter Options
@@ -81,8 +82,7 @@ MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 DOWNLOAD_TIMEOUT = 120
 CHUNK_SIZE = 8192
-MIN_FILE_SIZE = 1000
-MIN_FILE_SIZE_MASK = 500  # Smaller threshold for binary mask bands (e.g., snow_mask)
+MIN_FILE_SIZE = 10000
 
 # Status constants
 STATUS_NO_DATA = "no_data"
@@ -161,17 +161,14 @@ def get_utm_zone(longitude):
     return math.floor((longitude + 180) / 6) + 1
 
 
-def validate_geotiff_file(file_path, expected_bands=1, min_file_size=None):
+def validate_geotiff_file(file_path, expected_bands=1):
     """Validate that a GeoTIFF file is complete and readable."""
-    if min_file_size is None:
-        min_file_size = MIN_FILE_SIZE
-    
     try:
         if not os.path.exists(file_path):
             return False, "File does not exist"
         
         file_size = os.path.getsize(file_path)
-        if file_size < min_file_size:
+        if file_size < MIN_FILE_SIZE:
             return False, f"File too small ({file_size} bytes)"
         
         with rasterio.open(file_path) as src:
@@ -191,20 +188,23 @@ def create_water_quality_collection(aoi, start_date, end_date, parameter_type, c
     """
     Create water quality collection for either Turbidity or Chlorophyll.
     
+    Snow detection is used as a PREPROCESSING step to exclude snow/ice pixels
+    from water detection. Snow mask is NOT downloaded or reported.
+    
     For TURBIDITY (NDTI):
     1. Link S2_SR with S2_CLOUD_PROBABILITY
-    2. Apply cloud mask (probability < 20)
+    2. Apply cloud mask (probability < 15)
     3. Calculate NDSI for snow detection: (B3 - B11) / (B3 + B11)
-    4. Create snow mask: NDSI > 0.4 AND B11 > 0.1
-    5. Calculate NDWI for water body detection: (B3 - B12) / (B3 + B12) > 0.1
+    4. Create snow mask: NDSI > 0.3 AND B11 > 0.1
+    5. Calculate NDWI for water body detection: (B3 - B12) / (B3 + B12) > 0.1, excluding snow
     6. Calculate NDTI (turbidity index): (B4 - B3) / (B4 + B3)
     
     For CHLOROPHYLL:
     1. Link S2_SR with S2_CLOUD_PROBABILITY
-    2. Apply cloud mask (probability < 20)
+    2. Apply cloud mask (probability < 15)
     3. Calculate NDSI for snow detection: (B3 - B11) / (B3 + B11)
-    4. Create snow mask: NDSI > 0.4 AND B11 > 0.1
-    5. Calculate NDWI for water body detection: (B3 - B8) / (B3 + B8) >= 0.05
+    4. Create snow mask: NDSI > 0.3 AND B11 > 0.1
+    5. Calculate NDWI for water body detection: (B3 - B8) / (B3 + B8) >= 0.05, excluding snow
     6. Calculate Chlorophyll Index: 4.26 * (B3/B1)^3.94
     """
     # Get S2 SR collection
@@ -232,20 +232,19 @@ def create_water_quality_collection(aoi, start_date, end_date, parameter_type, c
     s2_joined = ee.ImageCollection(joined.map(add_cloud_band))
     
     if parameter_type == PARAM_TURBIDITY:
-        # Apply turbidity calculation with snow detection
         def calculate_turbidity(img):
-            # Cloud mask: probability < 20
+            # Cloud mask
             cloud = img.select('probability')
             cloud_free = cloud.lt(CLOUD_PROB_THRESHOLD)
             
-            # Scale reflectance bands (B2, B3, B4, B11, B12)
+            # Scale reflectance bands
             sr = img.select(['B2', 'B3', 'B4', 'B11', 'B12']).multiply(0.0001)
             
-            # SNOW DETECTION: NDSI = (B3 - B11) / (B3 + B11)
+            # SNOW DETECTION (preprocessing): exclude snow from water detection
             ndsi = sr.normalizedDifference(['B3', 'B11']).rename('ndsi')
             is_snow = ndsi.gt(NDSI_THRESHOLD).And(sr.select('B11').gt(SNOW_B11_THRESHOLD))
             
-            # WATER DETECTION: NDWI = (B3 - B12) / (B3 + B12) > 0.1, excluding snow
+            # WATER DETECTION: NDWI > 0.1, excluding snow
             ndwi = sr.normalizedDifference(['B3', 'B12']).rename('ndwi')
             water_body = ndwi.gt(NDWI_THRESHOLD_TURBIDITY).And(is_snow.Not())
             
@@ -260,29 +259,26 @@ def create_water_quality_collection(aoi, start_date, end_date, parameter_type, c
             
             combined = (wq_masked
                        .addBands(rgb)
-                       .addBands(water_body.rename('water_mask'))
-                       .addBands(is_snow.rename('snow_mask'))
-                       .addBands(ndsi))
+                       .addBands(water_body.rename('water_mask')))
             
             return combined.clip(aoi).copyProperties(img, ['system:time_start'])
         
         return s2_joined.map(calculate_turbidity)
     
     else:  # CHLOROPHYLL
-        # Apply chlorophyll calculation with snow detection
         def calculate_chlorophyll(img):
-            # Cloud mask: probability < 20
+            # Cloud mask
             cloud = img.select('probability')
             cloud_free = cloud.lt(CLOUD_PROB_THRESHOLD)
             
-            # Scale reflectance bands (B1, B2, B3, B4, B8, B11)
+            # Scale reflectance bands
             sr = img.select(['B1', 'B2', 'B3', 'B4', 'B8', 'B11']).multiply(0.0001)
             
-            # SNOW DETECTION: NDSI = (B3 - B11) / (B3 + B11)
+            # SNOW DETECTION (preprocessing): exclude snow from water detection
             ndsi = sr.normalizedDifference(['B3', 'B11']).rename('ndsi')
             is_snow = ndsi.gt(NDSI_THRESHOLD).And(sr.select('B11').gt(SNOW_B11_THRESHOLD))
             
-            # WATER DETECTION: NDWI = (B3 - B8) / (B3 + B8) >= 0.05, excluding snow
+            # WATER DETECTION: NDWI >= 0.05, excluding snow
             ndwi = sr.normalizedDifference(['B3', 'B8']).rename('ndwi')
             water_body = ndwi.gte(NDWI_THRESHOLD_CHLOROPHYLL).And(is_snow.Not())
             
@@ -303,9 +299,7 @@ def create_water_quality_collection(aoi, start_date, end_date, parameter_type, c
             
             combined = (wq_masked
                        .addBands(rgb)
-                       .addBands(water_body.rename('water_mask'))
-                       .addBands(is_snow.rename('snow_mask'))
-                       .addBands(ndsi))
+                       .addBands(water_body.rename('water_mask')))
             
             return combined.clip(aoi).copyProperties(img, ['system:time_start'])
         
@@ -349,11 +343,8 @@ def get_monthly_composite(wq_collection, aoi, year, month):
 # =============================================================================
 # Download Functions
 # =============================================================================
-def download_band_with_retry(image, band, aoi, output_path, scale=10, min_file_size=None):
+def download_band_with_retry(image, band, aoi, output_path, scale=10):
     """Download a single band with retry mechanism."""
-    if min_file_size is None:
-        min_file_size = MIN_FILE_SIZE
-    
     try:
         region = aoi.bounds().getInfo()['coordinates']
     except Exception as e:
@@ -364,7 +355,7 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10, min_file_s
         os.remove(temp_path)
     
     if os.path.exists(output_path):
-        is_valid, msg = validate_geotiff_file(output_path, expected_bands=1, min_file_size=min_file_size)
+        is_valid, msg = validate_geotiff_file(output_path, expected_bands=1)
         if is_valid:
             return True, "cached"
         os.remove(output_path)
@@ -392,11 +383,11 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10, min_file_s
                             f.write(chunk)
                             downloaded_size += len(chunk)
                 
-                if downloaded_size < min_file_size:
+                if downloaded_size < MIN_FILE_SIZE:
                     last_error = f"File too small ({downloaded_size} bytes)"
                     raise Exception(last_error)
                 
-                is_valid, msg = validate_geotiff_file(temp_path, expected_bands=1, min_file_size=min_file_size)
+                is_valid, msg = validate_geotiff_file(temp_path, expected_bands=1)
                 if is_valid:
                     os.replace(temp_path, output_path)
                     return True, "success"
@@ -433,22 +424,21 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10, min_file_s
 
 def download_monthly_data(composite, aoi, temp_dir, month_name, scale=10, status_placeholder=None):
     """
-    Download monthly composite (Water Quality Index + RGB + Snow mask bands).
+    Download monthly composite (Water Quality Index + RGB bands).
+    Snow mask is NOT downloaded — it is only used server-side in GEE.
     Returns paths to downloaded files.
     """
     wq_path = os.path.join(temp_dir, f"wq_index_{month_name}.tif")
     rgb_path = os.path.join(temp_dir, f"rgb_{month_name}.tif")
-    snow_path = os.path.join(temp_dir, f"snow_{month_name}.tif")
     
     # Check cache
     wq_valid, _ = validate_geotiff_file(wq_path, expected_bands=1)
     rgb_valid, _ = validate_geotiff_file(rgb_path, expected_bands=3)
-    snow_valid, _ = validate_geotiff_file(snow_path, expected_bands=1, min_file_size=MIN_FILE_SIZE_MASK)
     
-    if wq_valid and rgb_valid and snow_valid:
+    if wq_valid and rgb_valid:
         if status_placeholder:
             status_placeholder.info(f"✅ {month_name} using cache")
-        return wq_path, rgb_path, snow_path, STATUS_COMPLETE, "Cached"
+        return wq_path, rgb_path, STATUS_COMPLETE, "Cached"
     
     try:
         # Download Water Quality Index
@@ -457,18 +447,7 @@ def download_monthly_data(composite, aoi, temp_dir, month_name, scale=10, status
         
         success, msg = download_band_with_retry(composite, 'wq_index', aoi, wq_path, scale)
         if not success:
-            return None, None, None, STATUS_FAILED, f"WQ Index download failed: {msg}"
-        
-        # Download Snow mask (use smaller min_file_size for binary masks)
-        if status_placeholder:
-            status_placeholder.text(f"📥 {month_name}: Downloading snow mask...")
-        
-        success, msg = download_band_with_retry(
-            composite, 'snow_mask', aoi, snow_path, scale,
-            min_file_size=MIN_FILE_SIZE_MASK
-        )
-        if not success:
-            return None, None, None, STATUS_FAILED, f"Snow mask download failed: {msg}"
+            return None, None, STATUS_FAILED, f"WQ Index download failed: {msg}"
         
         # Download RGB bands
         bands_dir = os.path.join(temp_dir, f"bands_{month_name}")
@@ -485,7 +464,7 @@ def download_monthly_data(composite, aoi, temp_dir, month_name, scale=10, status
             success, msg = download_band_with_retry(composite, band, aoi, band_file, scale)
             
             if not success:
-                return None, None, None, STATUS_FAILED, f"RGB {band} download failed: {msg}"
+                return None, None, STATUS_FAILED, f"RGB {band} download failed: {msg}"
             
             band_files.append(band_file)
         
@@ -502,10 +481,10 @@ def download_monthly_data(composite, aoi, temp_dir, month_name, scale=10, status
                 with rasterio.open(band_file) as src:
                     dst.write(src.read(1), i+1)
         
-        return wq_path, rgb_path, snow_path, STATUS_COMPLETE, "Downloaded"
+        return wq_path, rgb_path, STATUS_COMPLETE, "Downloaded"
         
     except Exception as e:
-        return None, None, None, STATUS_FAILED, f"Error: {str(e)}"
+        return None, None, STATUS_FAILED, f"Error: {str(e)}"
 
 
 # =============================================================================
@@ -513,20 +492,18 @@ def download_monthly_data(composite, aoi, temp_dir, month_name, scale=10, status
 # =============================================================================
 def create_turbidity_colormap():
     """Create custom colormap for turbidity visualization."""
-    # Blue (clear) -> Green -> Yellow -> Red (turbid)
     colors = ['#0000FF', '#00FFFF', '#00FF00', '#FFFF00', '#FF8000', '#FF0000']
     return LinearSegmentedColormap.from_list('turbidity', colors, N=256)
 
 
 def create_chlorophyll_colormap():
-    """Create rainbow colormap for chlorophyll visualization (matching notebook)."""
-    # Rainbow colormap: violet -> blue -> cyan -> green -> yellow -> orange -> red
+    """Create rainbow colormap for chlorophyll visualization."""
     colors = ['#9400D3', '#4B0082', '#0000FF', '#00FF00', '#FFFF00', '#FF7F00', '#FF0000']
     return LinearSegmentedColormap.from_list('chlorophyll', colors, N=256)
 
 
-def generate_thumbnails(wq_path, rgb_path, snow_path, month_name, parameter_type, max_size=300):
-    """Generate RGB, water quality index, and snow mask thumbnails."""
+def generate_thumbnails(wq_path, rgb_path, month_name, parameter_type, max_size=300):
+    """Generate RGB and water quality index thumbnails."""
     try:
         # Read Water Quality Index
         with rasterio.open(wq_path) as src:
@@ -537,10 +514,6 @@ def generate_thumbnails(wq_path, rgb_path, snow_path, month_name, parameter_type
             red = src.read(1)
             green = src.read(2)
             blue = src.read(3)
-        
-        # Read Snow mask
-        with rasterio.open(snow_path) as src:
-            snow_data = src.read(1)
         
         # Process RGB
         rgb = np.stack([red, green, blue], axis=-1)
@@ -571,56 +544,28 @@ def generate_thumbnails(wq_path, rgb_path, snow_path, month_name, parameter_type
         total_pixels = wq_data.size
         water_coverage = (valid_pixel_count / total_pixels) * 100 if total_pixels > 0 else 0
         
-        # Calculate snow coverage
-        snow_valid = np.nan_to_num(snow_data, nan=0)
-        snow_pixels = np.sum(snow_valid > 0)
-        snow_coverage = (snow_pixels / total_pixels) * 100 if total_pixels > 0 else 0
-        
         # Choose colormap and normalization based on parameter type
         if parameter_type == PARAM_TURBIDITY:
             cmap = create_turbidity_colormap()
-            # Normalize NDTI to 0-1 range (typical range -0.3 to 0.3)
             wq_normalized = np.clip((wq_valid + 0.3) / 0.6, 0, 1)
         else:  # CHLOROPHYLL
             cmap = create_chlorophyll_colormap()
-            # Normalize chlorophyll to 0-1 range (typical range 2 to 100)
             wq_normalized = np.clip((wq_valid - CHL_VMIN) / (CHL_VMAX - CHL_VMIN), 0, 1)
         
         wq_normalized = np.nan_to_num(wq_normalized, nan=0)
         
         # Apply colormap
-        wq_colored = cmap(wq_normalized)[:, :, :3]  # RGB only
+        wq_colored = cmap(wq_normalized)[:, :, :3]
         wq_uint8 = (wq_colored * 255).astype(np.uint8)
         
         # Mask non-water areas (where WQ index is NaN or 0)
         water_mask = (~np.isnan(wq_valid)) & (wq_valid != 0)
         for i in range(3):
-            wq_uint8[:, :, i] = np.where(water_mask, wq_uint8[:, :, i], 50)  # Gray for non-water
-        
-        # Create snow visualization (cyan/white for snow)
-        snow_rgb = np.zeros((*snow_data.shape, 3), dtype=np.uint8)
-        snow_rgb[:, :, 0] = np.where(snow_valid > 0, 200, 50)  # R - light for snow
-        snow_rgb[:, :, 1] = np.where(snow_valid > 0, 230, 50)  # G - light for snow
-        snow_rgb[:, :, 2] = np.where(snow_valid > 0, 255, 50)  # B - bright for snow
-        
-        # Create combined RGB with snow highlighted (cyan overlay)
-        rgb_with_snow = rgb_uint8.copy()
-        snow_mask_bool = snow_valid > 0
-        rgb_with_snow[:, :, 0] = np.where(snow_mask_bool, 
-                                          np.clip(rgb_uint8[:, :, 0] * 0.5 + 100, 0, 255).astype(np.uint8),
-                                          rgb_uint8[:, :, 0])
-        rgb_with_snow[:, :, 1] = np.where(snow_mask_bool,
-                                          np.clip(rgb_uint8[:, :, 1] * 0.5 + 200, 0, 255).astype(np.uint8),
-                                          rgb_uint8[:, :, 1])
-        rgb_with_snow[:, :, 2] = np.where(snow_mask_bool,
-                                          np.clip(rgb_uint8[:, :, 2] * 0.5 + 255, 0, 255).astype(np.uint8),
-                                          rgb_uint8[:, :, 2])
+            wq_uint8[:, :, i] = np.where(water_mask, wq_uint8[:, :, i], 50)
         
         # Convert to PIL
         pil_rgb = Image.fromarray(rgb_uint8, mode='RGB')
         pil_wq = Image.fromarray(wq_uint8, mode='RGB')
-        pil_snow = Image.fromarray(snow_rgb, mode='RGB')
-        pil_rgb_snow = Image.fromarray(rgb_with_snow, mode='RGB')
         
         # Resize
         h, w = pil_rgb.size[1], pil_rgb.size[0]
@@ -629,20 +574,14 @@ def generate_thumbnails(wq_path, rgb_path, snow_path, month_name, parameter_type
             new_w, new_h = int(w * scale), int(h * scale)
             pil_rgb = pil_rgb.resize((new_w, new_h), Image.LANCZOS)
             pil_wq = pil_wq.resize((new_w, new_h), Image.LANCZOS)
-            pil_snow = pil_snow.resize((new_w, new_h), Image.NEAREST)
-            pil_rgb_snow = pil_rgb_snow.resize((new_w, new_h), Image.LANCZOS)
         
         return {
             'rgb_image': pil_rgb,
             'wq_image': pil_wq,
-            'snow_image': pil_snow,
-            'rgb_snow_image': pil_rgb_snow,
             'month_name': month_name,
             'mean_value': mean_value,
             'water_coverage': water_coverage,
-            'snow_coverage': snow_coverage,
             'valid_pixels': valid_pixel_count,
-            'snow_pixels': snow_pixels,
             'parameter_type': parameter_type
         }
         
@@ -680,14 +619,14 @@ def process_water_quality_timeseries(aoi, start_date, end_date, parameter_type,
         if parameter_type == PARAM_TURBIDITY:
             st.info(f"""
             ☁️ Cloud: < {CLOUD_PROB_THRESHOLD}% | 
-            ❄️ Snow: NDSI > {NDSI_THRESHOLD}, B11 > {SNOW_B11_THRESHOLD} | 
+            ❄️ Snow exclusion: NDSI > {NDSI_THRESHOLD}, B11 > {SNOW_B11_THRESHOLD} | 
             💧 Water: NDWI(B3,B12) > {NDWI_THRESHOLD_TURBIDITY} |
             📊 NDTI = (B4-B3)/(B4+B3)
             """)
         else:
             st.info(f"""
             ☁️ Cloud: < {CLOUD_PROB_THRESHOLD}% | 
-            ❄️ Snow: NDSI > {NDSI_THRESHOLD}, B11 > {SNOW_B11_THRESHOLD} | 
+            ❄️ Snow exclusion: NDSI > {NDSI_THRESHOLD}, B11 > {SNOW_B11_THRESHOLD} | 
             💧 Water: NDWI(B3,B8) ≥ {NDWI_THRESHOLD_CHLOROPHYLL} |
             📊 Chl = 4.26 × (B3/B1)^3.94
             """)
@@ -726,11 +665,10 @@ def process_water_quality_timeseries(aoi, start_date, end_date, parameter_type,
         # Check cache
         if resume and st.session_state.downloaded_months:
             for month_name, paths in st.session_state.downloaded_months.items():
-                if paths.get('wq_index') and paths.get('rgb') and paths.get('snow'):
+                if paths.get('wq_index') and paths.get('rgb'):
                     wq_valid, _ = validate_geotiff_file(paths['wq_index'], 1)
                     rgb_valid, _ = validate_geotiff_file(paths['rgb'], 3)
-                    snow_valid, _ = validate_geotiff_file(paths['snow'], 1, min_file_size=MIN_FILE_SIZE_MASK)
-                    if wq_valid and rgb_valid and snow_valid:
+                    if wq_valid and rgb_valid:
                         downloaded_months[month_name] = paths
                         month_statuses[month_name] = {'status': STATUS_COMPLETE, 'message': 'Cached'}
             
@@ -771,8 +709,8 @@ def process_water_quality_timeseries(aoi, start_date, end_date, parameter_type,
                     progress_bar.progress((idx + 1) / len(months_to_process))
                     continue
                 
-                # Download data
-                wq_path, rgb_path, snow_path, status, message = download_monthly_data(
+                # Download data (WQ index + RGB only, no snow mask)
+                wq_path, rgb_path, status, message = download_monthly_data(
                     composite, aoi, temp_dir, month_name, scale, status_text
                 )
                 
@@ -780,7 +718,7 @@ def process_water_quality_timeseries(aoi, start_date, end_date, parameter_type,
                 st.session_state.month_statuses[month_name] = month_statuses[month_name]
                 
                 if status == STATUS_COMPLETE:
-                    downloaded_months[month_name] = {'wq_index': wq_path, 'rgb': rgb_path, 'snow': snow_path}
+                    downloaded_months[month_name] = {'wq_index': wq_path, 'rgb': rgb_path}
                     st.session_state.downloaded_months[month_name] = downloaded_months[month_name]
                     st.write(f"🟢 **{month_name}**: {message} ({count} images)")
                 else:
@@ -822,7 +760,7 @@ def process_water_quality_timeseries(aoi, start_date, end_date, parameter_type,
             
             paths = downloaded_months[month_name]
             thumb = generate_thumbnails(
-                paths['wq_index'], paths['rgb'], paths['snow'], 
+                paths['wq_index'], paths['rgb'],
                 month_name, parameter_type
             )
             
@@ -830,8 +768,7 @@ def process_water_quality_timeseries(aoi, start_date, end_date, parameter_type,
                 results.append(thumb)
                 mean_wq_data[month_name] = {
                     'mean': thumb['mean_value'],
-                    'coverage': thumb['water_coverage'],
-                    'snow': thumb['snow_coverage']
+                    'coverage': thumb['water_coverage']
                 }
             
             progress_bar.progress((idx + 1) / len(month_names))
@@ -855,11 +792,10 @@ def process_water_quality_timeseries(aoi, start_date, end_date, parameter_type,
 # Display Functions
 # =============================================================================
 def display_results(results):
-    """Display water quality results with RGB, index, and snow images."""
+    """Display water quality results with RGB and index images."""
     if not results:
         return
     
-    # Get parameter type from first result
     parameter_type = results[0].get('parameter_type', PARAM_TURBIDITY)
     param_short = "NDTI" if parameter_type == PARAM_TURBIDITY else "Chl-a"
     param_icon = "🌊" if parameter_type == PARAM_TURBIDITY else "🌿"
@@ -867,43 +803,32 @@ def display_results(results):
     st.subheader(f"{param_icon} Monthly {parameter_type} Results")
     
     # Display mode selection
-    mode = st.radio("Display:", ["Side by Side", f"{param_short} Only", "RGB Only", "Snow Detection", "RGB + Snow Overlay"], horizontal=True)
+    mode = st.radio("Display:", ["Side by Side", f"{param_short} Only", "RGB Only"], horizontal=True)
     
     # Color legend
-    with st.expander("🎨 Color Legends"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if parameter_type == PARAM_TURBIDITY:
-                st.write("**Turbidity (NDTI)**")
-                fig, ax = plt.subplots(figsize=(6, 0.5))
-                cmap = create_turbidity_colormap()
-                gradient = np.linspace(0, 1, 256).reshape(1, -1)
-                ax.imshow(gradient, aspect='auto', cmap=cmap)
-                ax.set_xticks([0, 128, 255])
-                ax.set_xticklabels(['-0.3 (Clear)', '0 (Moderate)', '0.3 (Turbid)'])
-                ax.set_yticks([])
-                st.pyplot(fig)
-                plt.close()
-            else:
-                st.write("**Chlorophyll Index**")
-                fig, ax = plt.subplots(figsize=(6, 0.5))
-                cmap = create_chlorophyll_colormap()
-                gradient = np.linspace(0, 1, 256).reshape(1, -1)
-                ax.imshow(gradient, aspect='auto', cmap=cmap)
-                ax.set_xticks([0, 128, 255])
-                ax.set_xticklabels([f'{CHL_VMIN} (Low)', f'{(CHL_VMIN+CHL_VMAX)/2:.0f}', f'{CHL_VMAX} (High)'])
-                ax.set_yticks([])
-                st.pyplot(fig)
-                plt.close()
-        
-        with col2:
-            st.write("**Snow Detection**")
-            st.markdown("""
-            - 🔵 **Cyan/White**: Snow/Ice detected (NDSI > 0.4, B11 > 0.1)
-            - ⬛ **Gray**: No snow
-            - Water quality is calculated **excluding** snow pixels
-            """)
+    with st.expander("🎨 Color Legend"):
+        if parameter_type == PARAM_TURBIDITY:
+            st.write("**Turbidity (NDTI)**")
+            fig, ax = plt.subplots(figsize=(6, 0.5))
+            cmap = create_turbidity_colormap()
+            gradient = np.linspace(0, 1, 256).reshape(1, -1)
+            ax.imshow(gradient, aspect='auto', cmap=cmap)
+            ax.set_xticks([0, 128, 255])
+            ax.set_xticklabels(['-0.3 (Clear)', '0 (Moderate)', '0.3 (Turbid)'])
+            ax.set_yticks([])
+            st.pyplot(fig)
+            plt.close()
+        else:
+            st.write("**Chlorophyll Index**")
+            fig, ax = plt.subplots(figsize=(6, 0.5))
+            cmap = create_chlorophyll_colormap()
+            gradient = np.linspace(0, 1, 256).reshape(1, -1)
+            ax.imshow(gradient, aspect='auto', cmap=cmap)
+            ax.set_xticks([0, 128, 255])
+            ax.set_xticklabels([f'{CHL_VMIN} (Low)', f'{(CHL_VMIN+CHL_VMAX)/2:.0f}', f'{CHL_VMAX} (High)'])
+            ax.set_yticks([])
+            st.pyplot(fig)
+            plt.close()
     
     st.divider()
     
@@ -918,33 +843,9 @@ def display_results(results):
                         mean_str = f"{r['mean_value']:.4f}" if not np.isnan(r['mean_value']) else "N/A"
                     else:
                         mean_str = f"{r['mean_value']:.2f}" if not np.isnan(r['mean_value']) else "N/A"
-                    snow_str = f" ❄️{r['snow_coverage']:.1f}%" if r['snow_coverage'] > 0 else ""
-                    cols[j*2].image(r['rgb_image'], caption=f"{r['month_name']} RGB{snow_str}")
+                    cols[j*2].image(r['rgb_image'], caption=f"{r['month_name']} RGB")
                     cols[j*2+1].image(r['wq_image'], 
                                      caption=f"{r['month_name']} {param_short}: {mean_str}")
-    
-    elif mode == "Snow Detection":
-        for row in range((len(results) + 3) // 4):
-            cols = st.columns(4)
-            for c in range(4):
-                idx = row * 4 + c
-                if idx < len(results):
-                    r = results[idx]
-                    snow_pct = r['snow_coverage']
-                    cap = f"{r['month_name']} ❄️ {snow_pct:.1f}%"
-                    cols[c].image(r['snow_image'], caption=cap)
-    
-    elif mode == "RGB + Snow Overlay":
-        for row in range((len(results) + 3) // 4):
-            cols = st.columns(4)
-            for c in range(4):
-                idx = row * 4 + c
-                if idx < len(results):
-                    r = results[idx]
-                    snow_pct = r['snow_coverage']
-                    water_pct = r['water_coverage']
-                    cap = f"{r['month_name']} 💧{water_pct:.1f}% ❄️{snow_pct:.1f}%"
-                    cols[c].image(r['rgb_snow_image'], caption=cap)
     
     else:
         key = 'wq_image' if param_short in mode else 'rgb_image'
@@ -966,11 +867,10 @@ def display_results(results):
 
 
 def display_water_quality_chart(results):
-    """Display time series chart of mean water quality values with snow coverage."""
+    """Display time series chart of mean water quality values."""
     if not results:
         return
     
-    # Get parameter type from first result
     parameter_type = results[0].get('parameter_type', PARAM_TURBIDITY)
     param_short = "NDTI" if parameter_type == PARAM_TURBIDITY else "Chl-a"
     param_icon = "🌊" if parameter_type == PARAM_TURBIDITY else "🌿"
@@ -982,46 +882,38 @@ def display_water_quality_chart(results):
     months = []
     mean_values = []
     coverage_values = []
-    snow_values = []
     
     for r in results:
         months.append(r['month_name'])
         mean_values.append(r['mean_value'] if not np.isnan(r['mean_value']) else 0)
         coverage_values.append(r['water_coverage'])
-        snow_values.append(r['snow_coverage'])
     
     if not months:
         st.warning("No data to plot")
         return
     
-    # Check if any valid data
     valid_values = [m for m in mean_values if m != 0]
     
-    # Create figure with subplots
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), height_ratios=[2, 1])
+    # Create figure
+    fig, ax1 = plt.subplots(figsize=(12, 5))
     
-    # =========================================================================
-    # Plot 1: Mean water quality index with water coverage
-    # =========================================================================
     color1 = '#1f77b4' if parameter_type == PARAM_TURBIDITY else '#228B22'
     ax1.set_xlabel('Month')
     ax1.set_ylabel(f'Mean {param_short}{param_unit}', color=color1)
     
     if valid_values:
-        line1 = ax1.plot(months, mean_values, 'o-', color=color1, linewidth=2, markersize=8, label=f'Mean {param_short}')
+        ax1.plot(months, mean_values, 'o-', color=color1, linewidth=2, markersize=8, label=f'Mean {param_short}')
         ax1.tick_params(axis='y', labelcolor=color1)
         
-        # Set y-axis limits based on parameter type
         if parameter_type == PARAM_TURBIDITY:
             ax1.set_ylim(min(mean_values) - 0.02, max(mean_values) + 0.02)
             ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5, label='Neutral (NDTI=0)')
         else:
             ax1.set_ylim(0, max(mean_values) * 1.2)
     else:
-        ax1.text(0.5, 0.5, f'No valid {param_short} data\n(water may be frozen/snow-covered)', 
+        ax1.text(0.5, 0.5, f'No valid {param_short} data', 
                 ha='center', va='center', transform=ax1.transAxes, fontsize=12)
     
-    # Rotate x-axis labels
     ax1.set_xticklabels(months, rotation=45, ha='right')
     ax1.grid(True, alpha=0.3)
     
@@ -1036,21 +928,6 @@ def display_water_quality_chart(results):
     ax1.set_title(f'{param_icon} {parameter_type} Analysis Over Time', fontsize=14, fontweight='bold')
     ax1.legend(loc='upper left')
     
-    # =========================================================================
-    # Plot 2: Snow coverage time series
-    # =========================================================================
-    color_snow = '#00bfff'
-    ax2.fill_between(months, snow_values, alpha=0.5, color=color_snow, label='Snow Coverage')
-    ax2.plot(months, snow_values, 'o-', color='#0080ff', linewidth=2, markersize=6)
-    ax2.set_xlabel('Month')
-    ax2.set_ylabel('Snow Coverage (%)', color='#0080ff')
-    ax2.tick_params(axis='y', labelcolor='#0080ff')
-    ax2.set_xticklabels(months, rotation=45, ha='right')
-    ax2.grid(True, alpha=0.3)
-    ax2.set_ylim(0, max(snow_values) * 1.3 if max(snow_values) > 0 else 10)
-    ax2.set_title('❄️ Snow/Ice Coverage Over Time', fontsize=12, fontweight='bold')
-    ax2.legend(loc='upper right')
-    
     plt.tight_layout()
     st.pyplot(fig)
     plt.close()
@@ -1058,7 +935,7 @@ def display_water_quality_chart(results):
     # Statistics table
     st.subheader("📈 Statistics Summary")
     
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4 = st.columns(4)
     
     if valid_values:
         if parameter_type == PARAM_TURBIDITY:
@@ -1075,7 +952,6 @@ def display_water_quality_chart(results):
         col3.metric(f"Min {param_short}", "N/A")
     
     col4.metric("Avg Water %", f"{np.mean(coverage_values):.1f}%")
-    col5.metric("Avg Snow %", f"{np.mean(snow_values):.1f}%")
     
     # Data table
     with st.expander("📋 Monthly Data Table"):
@@ -1089,8 +965,7 @@ def display_water_quality_chart(results):
         df = pd.DataFrame({
             'Month': months,
             f'Mean {param_short}': value_col,
-            'Water Coverage (%)': [f"{v:.1f}" for v in coverage_values],
-            'Snow Coverage (%)': [f"{v:.1f}" for v in snow_values]
+            'Water Coverage (%)': [f"{v:.1f}" for v in coverage_values]
         })
         st.dataframe(df, use_container_width=True)
 
@@ -1208,8 +1083,8 @@ def main():
             st.markdown("""
             | Step | Parameter | Formula/Threshold | Description |
             |------|-----------|-------------------|-------------|
-            | 1 | Cloud Mask | probability < 20% | Remove cloudy pixels |
-            | 2 | Snow Detection | NDSI > 0.4 & B11 > 0.1 | Identify snow/ice |
+            | 1 | Cloud Mask | probability < 15% | Remove cloudy pixels |
+            | 2 | Snow Exclusion | NDSI > 0.3 & B11 > 0.1 | Exclude snow/ice from water |
             | 3 | Water Body | NDWI(B3,B12) > 0.1 | Detect water (excluding snow) |
             | 4 | **Turbidity** | **(B4-B3)/(B4+B3)** | **Calculate NDTI** |
             """)
@@ -1217,8 +1092,8 @@ def main():
             st.markdown("""
             | Step | Parameter | Formula/Threshold | Description |
             |------|-----------|-------------------|-------------|
-            | 1 | Cloud Mask | probability < 20% | Remove cloudy pixels |
-            | 2 | Snow Detection | NDSI > 0.4 & B11 > 0.1 | Identify snow/ice |
+            | 1 | Cloud Mask | probability < 15% | Remove cloudy pixels |
+            | 2 | Snow Exclusion | NDSI > 0.3 & B11 > 0.1 | Exclude snow/ice from water |
             | 3 | Water Body | NDWI(B3,B8) ≥ 0.05 | Detect water (excluding snow) |
             | 4 | **Chlorophyll** | **4.26 × (B3/B1)^3.94** | **Calculate Chl-a index** |
             """)
@@ -1298,7 +1173,6 @@ def main():
     # Process
     st.header("3️⃣ Process")
     
-    # Show selected parameter
     param_icon = "🌊" if parameter_type == PARAM_TURBIDITY else "🌿"
     st.info(f"{param_icon} **Selected Parameter:** {parameter_type}")
     
