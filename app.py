@@ -5,7 +5,7 @@ Sentinel-2 based NDTI (Normalized Difference Turbidity Index) calculation
 
 ALGORITHM:
 1. Link S2_SR with S2_CLOUD_PROBABILITY
-2. Cloud masking: probability < 20
+2. Cloud masking: probability < 15
 3. Water body detection: NDWI = (B3 - B12) / (B3 + B12) > 0.1
 4. Turbidity: NDTI = (B4 - B3) / (B4 + B3)
 5. Monthly composites with mean turbidity statistics
@@ -57,7 +57,7 @@ CALC_BANDS_TURBIDITY = ['B3', 'B4', 'B11', 'B12']  # For NDWI, NDTI, and NDSI (s
 CALC_BANDS_CHLOROPHYLL = ['B1', 'B3', 'B8', 'B11']  # For Chlorophyll, NDWI, NDSI
 
 # Cloud masking threshold
-CLOUD_PROB_THRESHOLD = 20
+CLOUD_PROB_THRESHOLD = 15
 
 # Water body detection thresholds
 NDWI_THRESHOLD_TURBIDITY = 0.1  # NDWI using B3, B12
@@ -65,7 +65,7 @@ NDWI_THRESHOLD_CHLOROPHYLL = 0.05  # NDWI using B3, B8
 
 # Snow detection thresholds
 # NDSI (Normalized Difference Snow Index) = (B3 - B11) / (B3 + B11)
-NDSI_THRESHOLD = 0.4
+NDSI_THRESHOLD = 0.3
 SNOW_B11_THRESHOLD = 0.1  # Snow has high SWIR reflectance, water has low
 
 # Water Quality Parameter Options
@@ -81,7 +81,7 @@ MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 DOWNLOAD_TIMEOUT = 120
 CHUNK_SIZE = 8192
-MIN_FILE_SIZE = 10000
+MIN_FILE_SIZE = 500
 
 # Status constants
 STATUS_NO_DATA = "no_data"
