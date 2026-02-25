@@ -65,7 +65,7 @@ NDWI_THRESHOLD_CHLOROPHYLL = 0.05  # NDWI using B3, B8
 
 # Snow detection thresholds
 # NDSI (Normalized Difference Snow Index) = (B3 - B11) / (B3 + B11)
-NDSI_THRESHOLD = 0.4
+NDSI_THRESHOLD = 0.3
 SNOW_B11_THRESHOLD = 0.1  # Snow has high SWIR reflectance, water has low
 
 # Water Quality Parameter Options
@@ -81,7 +81,8 @@ MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 DOWNLOAD_TIMEOUT = 120
 CHUNK_SIZE = 8192
-MIN_FILE_SIZE = 500
+MIN_FILE_SIZE = 10000
+MIN_FILE_SIZE_MASK = 500  # Smaller threshold for binary mask bands (e.g., snow_mask)
 
 # Status constants
 STATUS_NO_DATA = "no_data"
@@ -160,14 +161,17 @@ def get_utm_zone(longitude):
     return math.floor((longitude + 180) / 6) + 1
 
 
-def validate_geotiff_file(file_path, expected_bands=1):
+def validate_geotiff_file(file_path, expected_bands=1, min_file_size=None):
     """Validate that a GeoTIFF file is complete and readable."""
+    if min_file_size is None:
+        min_file_size = MIN_FILE_SIZE
+    
     try:
         if not os.path.exists(file_path):
             return False, "File does not exist"
         
         file_size = os.path.getsize(file_path)
-        if file_size < MIN_FILE_SIZE:
+        if file_size < min_file_size:
             return False, f"File too small ({file_size} bytes)"
         
         with rasterio.open(file_path) as src:
@@ -345,8 +349,11 @@ def get_monthly_composite(wq_collection, aoi, year, month):
 # =============================================================================
 # Download Functions
 # =============================================================================
-def download_band_with_retry(image, band, aoi, output_path, scale=10):
+def download_band_with_retry(image, band, aoi, output_path, scale=10, min_file_size=None):
     """Download a single band with retry mechanism."""
+    if min_file_size is None:
+        min_file_size = MIN_FILE_SIZE
+    
     try:
         region = aoi.bounds().getInfo()['coordinates']
     except Exception as e:
@@ -357,7 +364,7 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
         os.remove(temp_path)
     
     if os.path.exists(output_path):
-        is_valid, msg = validate_geotiff_file(output_path, expected_bands=1)
+        is_valid, msg = validate_geotiff_file(output_path, expected_bands=1, min_file_size=min_file_size)
         if is_valid:
             return True, "cached"
         os.remove(output_path)
@@ -385,11 +392,11 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
                             f.write(chunk)
                             downloaded_size += len(chunk)
                 
-                if downloaded_size < MIN_FILE_SIZE:
+                if downloaded_size < min_file_size:
                     last_error = f"File too small ({downloaded_size} bytes)"
                     raise Exception(last_error)
                 
-                is_valid, msg = validate_geotiff_file(temp_path, expected_bands=1)
+                is_valid, msg = validate_geotiff_file(temp_path, expected_bands=1, min_file_size=min_file_size)
                 if is_valid:
                     os.replace(temp_path, output_path)
                     return True, "success"
@@ -436,7 +443,7 @@ def download_monthly_data(composite, aoi, temp_dir, month_name, scale=10, status
     # Check cache
     wq_valid, _ = validate_geotiff_file(wq_path, expected_bands=1)
     rgb_valid, _ = validate_geotiff_file(rgb_path, expected_bands=3)
-    snow_valid, _ = validate_geotiff_file(snow_path, expected_bands=1)
+    snow_valid, _ = validate_geotiff_file(snow_path, expected_bands=1, min_file_size=MIN_FILE_SIZE_MASK)
     
     if wq_valid and rgb_valid and snow_valid:
         if status_placeholder:
@@ -452,11 +459,14 @@ def download_monthly_data(composite, aoi, temp_dir, month_name, scale=10, status
         if not success:
             return None, None, None, STATUS_FAILED, f"WQ Index download failed: {msg}"
         
-        # Download Snow mask
+        # Download Snow mask (use smaller min_file_size for binary masks)
         if status_placeholder:
             status_placeholder.text(f"📥 {month_name}: Downloading snow mask...")
         
-        success, msg = download_band_with_retry(composite, 'snow_mask', aoi, snow_path, scale)
+        success, msg = download_band_with_retry(
+            composite, 'snow_mask', aoi, snow_path, scale,
+            min_file_size=MIN_FILE_SIZE_MASK
+        )
         if not success:
             return None, None, None, STATUS_FAILED, f"Snow mask download failed: {msg}"
         
@@ -719,7 +729,7 @@ def process_water_quality_timeseries(aoi, start_date, end_date, parameter_type,
                 if paths.get('wq_index') and paths.get('rgb') and paths.get('snow'):
                     wq_valid, _ = validate_geotiff_file(paths['wq_index'], 1)
                     rgb_valid, _ = validate_geotiff_file(paths['rgb'], 3)
-                    snow_valid, _ = validate_geotiff_file(paths['snow'], 1)
+                    snow_valid, _ = validate_geotiff_file(paths['snow'], 1, min_file_size=MIN_FILE_SIZE_MASK)
                     if wq_valid and rgb_valid and snow_valid:
                         downloaded_months[month_name] = paths
                         month_statuses[month_name] = {'status': STATUS_COMPLETE, 'message': 'Cached'}
