@@ -65,7 +65,7 @@ NDWI_THRESHOLD_CHLOROPHYLL = 0.05  # NDWI using B3, B8
 
 # Snow detection thresholds
 # NDSI (Normalized Difference Snow Index) = (B3 - B11) / (B3 + B11)
-NDSI_THRESHOLD = 0.3
+NDSI_THRESHOLD = 0.4
 SNOW_B11_THRESHOLD = 0.1  # Snow has high SWIR reflectance, water has low
 
 # Water Quality Parameter Options
