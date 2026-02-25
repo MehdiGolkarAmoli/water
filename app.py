@@ -65,7 +65,7 @@ NDWI_THRESHOLD_CHLOROPHYLL = 0.05  # NDWI using B3, B8
 
 # Snow detection thresholds
 # NDSI (Normalized Difference Snow Index) = (B3 - B11) / (B3 + B11)
-NDSI_THRESHOLD = 0.3
+NDSI_THRESHOLD = 0.4
 SNOW_B11_THRESHOLD = 0.1  # Snow has high SWIR reflectance, water has low
 
 # Water Quality Parameter Options
@@ -81,7 +81,7 @@ MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 DOWNLOAD_TIMEOUT = 120
 CHUNK_SIZE = 8192
-MIN_FILE_SIZE = 10000
+MIN_FILE_SIZE = 1000
 MIN_FILE_SIZE_MASK = 500  # Smaller threshold for binary mask bands (e.g., snow_mask)
 
 # Status constants
